@@ -1,0 +1,10 @@
+fastapi             # High-speed Backend
+uvicorn             # Server to run FastAPI
+langgraph           # Agentic RAG Framework
+langchain-openai    # Brain (works with GPT/Local models)
+yfinance            # Indian & Global Stock Data
+alpha_vantage       # High-fidelity US Market Data
+pandas              # Data manipulation for "Fairness" checks
+pydantic-settings   # Securely loading your .env keys
+python-dotenv       # Environment variables
+duckduckgo-search   # Free news search agent
