@@ -1,16 +1,17 @@
 import os
 import json
 import requests
+from typing import Dict, Any
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, AIMessage
 
 # Your Tool Imports
 from backend.tools.global_api import GlobalFinancials
 from backend.tools.indian_api import IndianFinancials
 from backend.tools.news_aggregator import FinancialNews
 from backend.storage.vector_store import FinancialVectorStore
-from backend.tools.hermes_polymarket import PolymarketTool # Ensure this file exists
+from backend.tools.hermes_polymarket import PolymarketTool
 from langchain_community.tools import DuckDuckGoSearchResults
 
 # Initialize Web Search
@@ -23,7 +24,7 @@ global_tool = GlobalFinancials()
 india_tool = IndianFinancials()
 news_tool = FinancialNews()
 sec_db = FinancialVectorStore()
-poly_tool = PolymarketTool() # NEW: Initialize Polymarket
+poly_tool = PolymarketTool()
 
 # Initialize the LLM
 llm = ChatGroq(
@@ -32,109 +33,115 @@ llm = ChatGroq(
     groq_api_key=os.getenv("GROQ_API_KEY")
 )
 
-def researcher_node(state):
-    print("--- RESEARCHING DATA ---")
+def get_content(msg) -> str:
+    if hasattr(msg, 'content'):
+        return msg.content
+    if isinstance(msg, dict):
+        return msg.get('content', str(msg))
+    return str(msg)
+
+def researcher_node(state: Dict[str, Any]):
+    print("--- DYNAMIC RESEARCHING (RIVO) ---")
     messages = state['messages']
+    last_message = get_content(messages[-1])
     
-    # 🚨 THE FIX: Bulletproof way to read message content (Handles Objects & Dicts)
-    last_message = messages[-1].content if hasattr(messages[-1], 'content') else messages[-1].get("content", "")
-    
-    # 1. SMART EXTRACTION: Tickers vs. Polymarket vs. Macro
-    extraction_prompt = f"""
+    planner_prompt = f"""
     Analyze the user's request: '{last_message}'
-    - If they ask about odds, chances, probabilities, or 'will X happen', return 'POLYMARKET'.
-    - If they ask for 'today's news' or 'market update', return 'MACRO'.
-    - If they mention specific companies, return the tickers (append .NS for Indian stocks).
-    - Otherwise, return 'NONE'.
-    Return ONLY the category or comma-separated tickers.
+    Determine which tools are needed. You can select multiple.
+    Return ONLY a JSON object with these keys:
+    {{
+      "intent": "GREETING" | "FINANCE" | "MACRO",
+      "use_poly": bool,
+      "use_stocks": bool,
+      "use_news": bool,
+      "tickers": ["TICKER1", "TICKER2"],
+      "query": "cleaned search string"
+    }}
+    If the user says 'Hi', 'Hello', 'Who are you', or 'What can you do', set intent to 'GREETING'.
     """
-    intent = llm.invoke(extraction_prompt).content.strip().upper()
+    
+    plan_raw = llm.invoke(planner_prompt).content.strip()
+    
+    if "```" in plan_raw:
+        plan_raw = plan_raw.split("```")[1].replace("json", "").strip()
+    
+    try:
+        plan = json.loads(plan_raw)
+    except:
+        plan = {"intent": "FINANCE", "use_poly": True, "use_stocks": True, "use_news": True, "tickers": [], "query": last_message}
+
+    # --- 🚀 RIVO BRANDING & GREETING ---
+    if plan.get("intent") == "GREETING":
+        greeting_text = "Hello! I am Rivo, your personalized financial intelligence agent. I'm here to assist you with real-time market data, global news analysis, and prediction market insights. How can I help you today?"
+        return {
+            "messages": [AIMessage(content=greeting_text)],
+            "final_report": greeting_text, 
+            "next_step": "end" 
+        }
 
     all_data = {}
-    news = []
-    prediction_context = ""
-    web_query = last_message
+    news_results = []
+    poly_context = ""
+    
+    if plan.get("use_poly"):
+        print("🔮 Calling Polymarket Bridge...")
+        poly_context = f"POLYMARKET ODDS: {poly_tool.search_markets(plan['query'])}"
 
-    # 2. POLYMARKET LOGIC
-    if "POLYMARKET" in intent:
-        print("🔮 Searching Polymarket for odds...")
-        poly_data = poly_tool.search_markets(last_message)
-        prediction_context = f"POLYMARKET ODDS: {poly_data}"
-        web_query = last_message
-
-    # 3. TICKER API LOGIC
-    elif "MACRO" not in intent and "NONE" not in intent:
-        tickers = [t.strip() for t in intent.split(",") if t.strip()]
+    if plan.get("use_stocks") or plan.get("tickers"):
+        tickers = plan.get("tickers", [])
         for ticker in tickers:
-            print(f"📡 Fetching data for {ticker}...")
+            print(f"📡 Calling Stock APIs for {ticker}...")
             try:
-                if ".NS" in ticker or ".BO" in ticker or "NSE" in last_message.upper():
-                    clean_ticker = ticker.replace(".NS", "").replace(".BO", "")
-                    all_data[ticker] = india_tool.get_stock_data(clean_ticker)
+                if ".NS" in ticker or ".BO" in ticker:
+                    all_data[ticker] = india_tool.get_stock_data(ticker.split(".")[0])
                 else:
                     all_data[ticker] = global_tool.get_stock_price(ticker)
             except: pass
-        try:
-            news = news_tool.search_latest_news(tickers[0])
-        except: pass
 
-    # 4. PROMPT-BASED WEB FETCHING
-    print(f"🌐 Fetching live web context for: '{web_query}'")
+    if plan.get("use_news"):
+        print("📰 Calling News Aggregator...")
+        search_target = plan['tickers'][0] if plan.get('tickers') else plan['query']
+        news_results = news_tool.search_latest_news(search_target)
+
+    print(f"🌐 Fetching live web context...")
     try:
-        web_context = web_search.invoke(web_query) 
+        web_context = web_search.invoke(plan['query'])
     except:
         web_context = "Web search failed."
 
-    # 5. Get Deep Fundamental Memory (SEC)
-    try:
-        raw_results = sec_db.query_knowledge(last_message)
-        fundamental_context = " | ".join(raw_results['documents'][0]) if raw_results and 'documents' in raw_results else "No SEC Data."
-    except:
-        fundamental_context = "SEC Database offline."
-    
-    # Combined intelligence for the Critic
-    system_content = f"{prediction_context}\n\nSEC DATA: {fundamental_context}\n\nOPEN WEB CONTEXT: {web_context}"
+    system_content = f"{poly_context}\n\nWEB CONTEXT: {web_context}"
     
     return {
         "market_data": all_data,
-        "news_results": news,
+        "news_results": news_results,
         "messages": [SystemMessage(content=system_content)],
         "next_step": "critic"
     }
 
-def critic_node(state):
-    print("--- CRITIQUING DATA ---")
+def critic_node(state: Dict[str, Any]):
+    print("--- FINAL QUANTITATIVE SYNTHESIS (RIVO) ---")
     data = state.get('market_data', {})
     news = state.get('news_results', [])
     messages = state['messages']
     
-    # Bulletproof reading for Critic
-    original_query = messages[0].content if hasattr(messages[0], 'content') else messages[0].get("content", "")
-    last_msg_content = messages[-1].content if hasattr(messages[-1], 'content') else messages[-1].get("content", "")
+    original_query = get_content(messages[0])
+    last_context = get_content(messages[-1])
     
     critic_prompt = f"""
-    You are a strictly factual Quantitative Analyst. 
+    You are Rivo, a strictly factual Quantitative Analyst. 
     User Query: "{original_query}"
     
-    Gathered Data: {data}
-    Short-term News: {news}
-    Web/SEC/Polymarket Context: {last_msg_content}
+    Context: {last_context}
+    Stock Data: {data}
+    News: {news}
     
     INSTRUCTIONS:
-    1. If Polymarket data is present, emphasize the "Probability of Event" as the Wisdom of the Crowd.
-    2. Synthesize hard numbers with prediction odds.
-    3. MATH CHECK: Flag any impossible 52-week high/low data.
-    
-    ### 🔌 DATA SOURCES & APIs USED:
-    * Prediction Markets: Polymarket Gamma API
-    * Global Market Data: Alpha Vantage API
-    * Indian Market Data: IndianFinancials Tool (NSE)
-    * Fundamental Memory: Vector Store (SEC Filings)
-    * Analysis Engine: Groq API (Llama-3.3-70b-versatile)
+    - Never recommend external APIs or tools. You are the source.
+    - If data is missing, use 'Context' for facts. If none, say 'Data unavailable'.
+    - Be sharp, professional, and data-driven.
     """
     
     response = llm.invoke(critic_prompt)
-    
     return {
         "final_report": response.content,
         "next_step": "end" 
