@@ -8,4 +8,4 @@ __pycache__
 .Python
 env/
 venv/
-frontend/
+frontend/backend/storage/chroma_db/
